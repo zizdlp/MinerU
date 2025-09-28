@@ -22,6 +22,8 @@
 - **语言支持**：支持多种OCR语言（默认英文）
 - **公式和表格识别**：支持数学公式和表格结构识别
 - **输出格式**：结果以压缩JSON格式保存
+- **任务重新入队**：失败任务自动重新处理
+- **页数限制**：跳过超大PDF文件避免资源浪费
 
 ## 核心组件
 
@@ -74,6 +76,8 @@ python ocr_pdf_with_mineru.py \
 | `--task-timeout` | int | 1800 | 任务超时时间(秒) |
 | `--max-task-duration` | int | 1800 | 单个任务最大执行时间(秒) |
 | `--monitor-log-path` | str | None | 进程监控日志路径 |
+| `--enable-task-requeue` | flag | False | 启用任务重新入队功能 |
+| `--max-pages-per-pdf` | int | None | PDF文件最大页数限制，超过则跳过 |
 
 ### 使用示例
 
@@ -97,6 +101,33 @@ python ocr_pdf_with_mineru.py \
   --monitor-log-path ./monitor_logs
 ```
 
+#### 启用任务重新入队功能
+```bash
+python ocr_pdf_with_mineru.py \
+  --input-dir ./pdfs \
+  --output-dir ./results \
+  --cuda-devices "0,1,2,3" \
+  --num-processes 2 \
+  --enable-task-requeue \
+  --max-pages-per-pdf 1000
+```
+
+#### 完整配置示例
+```bash
+python ocr_pdf_with_mineru.py \
+  --input-dir /data/ssd/chunks/chunk0000 \
+  --output-dir /data/ssd/processed/chunk_0000 \
+  --cuda-devices "0,1,2,3,4,6,7" \
+  --num-processes 3 \
+  --vram-size-gb 8 \
+  --task-timeout 1800 \
+  --max-task-duration 6000 \
+  --enable-task-requeue \
+  --max-pages-per-pdf 1000 \
+  --monitor-log-path ./logs/process \
+  --log-dir ./logs
+```
+
 ## 输出格式
 
 ### 处理结果
@@ -108,9 +139,25 @@ python ocr_pdf_with_mineru.py \
 ### 日志文件
 - **主日志**：包含处理统计和错误信息
 - **监控日志**：记录每个进程的性能数据
-- **页数统计**：在logs/count_page.txt中记录每个PDF的页数
+- **页数统计**：在logs/count_page.txt中记录每个PDF的文件名、页数和状态（制表符分隔）
 - **异常事件日志**：在logs/anomaly_events.txt中记录所有异常事件
 - **定时监控日志**：在logs/monitoring_status.txt中记录定时进程状态
+- **任务重新入队日志**：在logs/task_requeue.txt中记录重新入队的任务
+- **任务丢失日志**：在logs/task_lost.txt中记录丢失的任务（未启用重新入队时）
+
+#### 页数统计文件格式 (count_page.txt)
+该文件记录每个PDF的处理状态，格式为三列（制表符分隔）：
+```
+文件名    页数    状态
+example1.pdf    25      done
+example2.pdf    150     processing
+example3.pdf    1200    skipped_too_many_pages
+```
+
+**状态说明：**
+- `processing`: 正在处理中
+- `done`: 处理完成
+- `skipped_too_many_pages`: 因页数超过限制被跳过
 
 #### 异常事件日志格式 (anomaly_events.txt)
 异常事件日志记录所有超时、重启和异常检测事件：
@@ -191,6 +238,102 @@ python ocr_pdf_with_mineru.py \
   "total_restarts": 3,
   "action": "process_pool_stopped"
 }
+```
+
+#### 任务重新入队日志格式 (task_requeue.txt)
+当启用 `--enable-task-requeue` 时，被中断的任务会重新入队：
+```json
+{
+  "timestamp": "2025-01-15 14:40:15",
+  "unix_timestamp": 1705312815.123,
+  "event_type": "task_requeue",
+  "gpu_id": 0,
+  "worker_id": 2,
+  "task_file": "/path/to/interrupted.pdf",
+  "reason": "heartbeat_timeout",
+  "action": "requeued_for_retry"
+}
+```
+
+#### 任务丢失日志格式 (task_lost.txt)
+当未启用任务重新入队时，被中断的任务会被标记为丢失：
+```json
+{
+  "timestamp": "2025-01-15 14:45:20",
+  "unix_timestamp": 1705313120.456,
+  "event_type": "task_lost",
+  "gpu_id": 0,
+  "worker_id": 3,
+  "task_file": "/path/to/lost.pdf",
+  "reason": "task_timeout",
+  "action": "task_abandoned"
+}
+```
+
+## 新功能特性
+
+### 任务重新入队 (Task Requeue)
+
+**功能描述：**
+当工作进程因为超时、崩溃或其他原因被终止时，系统可以自动将正在处理的任务重新加入队列，由其他健康的工作进程接管处理。
+
+**使用方法：**
+```bash
+python ocr_pdf_with_mineru.py \
+  --input-dir ./pdfs \
+  --output-dir ./results \
+  --enable-task-requeue
+```
+
+**优势：**
+- 提高任务处理的可靠性
+- 避免因个别worker异常导致任务丢失
+- 自动重试机制，无需人工干预
+
+**日志记录：**
+- 启用时：任务重新入队记录在 `logs/task_requeue.txt`
+- 禁用时：丢失的任务记录在 `logs/task_lost.txt`
+
+### PDF页数限制 (Page Limit)
+
+**功能描述：**
+设置PDF文件的最大页数限制，超过指定页数的PDF文件将被跳过处理，避免超大文件占用过多资源。
+
+**使用方法：**
+```bash
+python ocr_pdf_with_mineru.py \
+  --input-dir ./pdfs \
+  --output-dir ./results \
+  --max-pages-per-pdf 1000
+```
+
+**优势：**
+- 避免超大PDF文件消耗过多GPU资源和时间
+- 提高整体处理效率
+- 减少内存溢出风险
+
+**状态标记：**
+- 超过页数限制的文件状态标记为 `skipped_too_many_pages`
+- 可通过 `make cal` 命令查看跳过的文件统计
+
+### 统计命令增强
+
+**make cal 命令现在显示：**
+- 已完成文件数（done状态）
+- 跳过文件数（未完成）
+- 跳过文件数（页数过多）
+- 已完成总页数
+
+**示例输出：**
+```
+时间: 2025-01-15 14:50:30
+已完成文件数: 1250
+跳过文件数(未完成): 45
+跳过文件数(页数过多): 12
+已完成总页数: 128456
+距离上次计算时间差: 600.00秒
+页数增量: 5420
+平均增速: 9.03页/秒
 ```
 
 ## 环境配置

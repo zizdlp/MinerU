@@ -29,6 +29,8 @@ parser.add_argument('--log-dir', type=str, default='/tmp', help='日志目录')
 parser.add_argument('--task-timeout', type=int, default=1800, help='任务超时时间（秒）')
 parser.add_argument('--max-task-duration', type=int, default=1800, help='每个任务最大执行时间（秒），默认1800秒即30分钟')
 parser.add_argument('--monitor-log-path', type=str, default=None, help='进程监控日志路径，用于记录每个进程的处理统计')
+parser.add_argument('--enable-task-requeue', action='store_true', default=False, help='是否启用任务重新入队功能，当worker超时或崩溃时重新处理任务')
+parser.add_argument('--max-pages-per-pdf', type=int, default=None, help='PDF文件最大页数限制，超过此页数的PDF将被跳过处理')
 args = parser.parse_args()
 
 def infer_one_pdf(pdf_file_path, lang="en"):
@@ -82,7 +84,7 @@ def infer_one_pdf(pdf_file_path, lang="en"):
     }
     return ocr_result
 
-def process_one_pdf_file(pdf_path, save_dir, lang="en"):
+def process_one_pdf_file(pdf_path, save_dir, lang="en", max_pages_per_pdf=None):
     pdf_file_name = os.path.basename(pdf_path).replace(".pdf", "")
     target_file = f"{save_dir}/{pdf_file_name}.json.zip"
     if not os.path.exists(f"{save_dir}/"):
@@ -100,6 +102,17 @@ def process_one_pdf_file(pdf_path, save_dir, lang="en"):
         logs_dir = "logs"
         if not os.path.exists(logs_dir):
             os.makedirs(logs_dir, exist_ok=True)
+
+        # Check if PDF exceeds maximum page limit
+        if max_pages_per_pdf is not None and page_count > max_pages_per_pdf:
+            # Write PDF info and mark as skipped
+            count_file = os.path.join(logs_dir, "count_page.txt")
+            pdf_filename = os.path.basename(pdf_path)
+            with open(count_file, "a", encoding="utf-8") as f:
+                f.write(f"{pdf_filename}\t{page_count}\tskipped_too_many_pages\n")
+
+            logger.warning(f"PDF {pdf_path} has {page_count} pages (limit: {max_pages_per_pdf}), skipped")
+            raise Exception(f"PDF has too many pages: {page_count} > {max_pages_per_pdf}, skipped")
 
         # Write PDF name and page count to count_page.txt (three columns: filename, page_count, status)
         count_file = os.path.join(logs_dir, "count_page.txt")
@@ -162,6 +175,8 @@ class GPUProcessPool:
     task_timeout: int = 1800
     max_task_duration: int = 1800  # 30分钟 = 1800秒
     monitor_log_path: Optional[str] = None  # 监控日志路径
+    enable_task_requeue: bool = False  # 是否启用任务重新入队
+    max_pages_per_pdf: Optional[int] = None  # PDF最大页数限制
 
     def __post_init__(self):
         self.task_queue = mp.Queue()
@@ -189,7 +204,7 @@ class GPUProcessPool:
 
         process = mp.Process(
             target=gpu_specific_worker,
-            args=(worker_id, self.gpu_id, self.task_queue, self.result_queue, self.monitor_log_path),
+            args=(worker_id, self.gpu_id, self.task_queue, self.result_queue, self.monitor_log_path, self.max_pages_per_pdf),
             daemon=True
         )
         process.start()
@@ -438,8 +453,9 @@ class GPUProcessPool:
                             del self.worker_status[worker_id]
                         if worker_id in self.worker_last_heartbeat:
                             del self.worker_last_heartbeat[worker_id]
-                        # 如果worker正在处理任务，将任务重新入队
-                        if (worker_id in self.worker_current_task_data and
+                        # 如果启用了任务重新入队功能，并且worker正在处理任务，将任务重新入队
+                        if (self.enable_task_requeue and
+                            worker_id in self.worker_current_task_data and
                             self.worker_status.get(worker_id) == 'busy'):
                             task_data = self.worker_current_task_data[worker_id]
                             task_file = self.worker_current_tasks.get(worker_id, 'unknown')
@@ -468,6 +484,34 @@ class GPUProcessPool:
 
                             with open(requeue_log_file, "a", encoding="utf-8") as f:
                                 f.write(json.dumps(requeue_info, ensure_ascii=False) + '\n')
+                        elif (worker_id in self.worker_current_task_data and
+                              self.worker_status.get(worker_id) == 'busy'):
+                            # 如果没有启用重新入队，记录丢失的任务
+                            task_file = self.worker_current_tasks.get(worker_id, 'unknown')
+                            print(f"GPU {self.gpu_id} task {task_file} lost due to worker {worker_id} {reason} (requeue disabled)")
+
+                            # 记录任务丢失事件
+                            logs_dir = "logs"
+                            if not os.path.exists(logs_dir):
+                                os.makedirs(logs_dir, exist_ok=True)
+
+                            lost_log_file = os.path.join(logs_dir, "task_lost.txt")
+                            current_time = time.time()
+                            timestamp = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time))
+
+                            lost_info = {
+                                'timestamp': timestamp,
+                                'unix_timestamp': current_time,
+                                'event_type': 'task_lost',
+                                'gpu_id': self.gpu_id,
+                                'worker_id': worker_id,
+                                'task_file': task_file,
+                                'reason': reason,
+                                'action': 'task_abandoned'
+                            }
+
+                            with open(lost_log_file, "a", encoding="utf-8") as f:
+                                f.write(json.dumps(lost_info, ensure_ascii=False) + '\n')
 
                         if worker_id in self.worker_current_tasks:
                             del self.worker_current_tasks[worker_id]
@@ -689,9 +733,9 @@ class GPUProcessPool:
 
 class MultiGPUProcessManager:
     """多GPU进程管理器"""
-    
+
     def __init__(self, gpu_devices: List[int], processes_per_gpu: int,
-                 task_timeout: int = 1800, max_task_duration: int = 1800, monitor_log_path: Optional[str] = None):
+                 task_timeout: int = 1800, max_task_duration: int = 1800, monitor_log_path: Optional[str] = None, enable_task_requeue: bool = False, max_pages_per_pdf: Optional[int] = None):
         self.gpu_pools: Dict[int, GPUProcessPool] = {}
         self.lock = threading.Lock()
 
@@ -702,7 +746,9 @@ class MultiGPUProcessManager:
                 num_processes=processes_per_gpu,
                 task_timeout=task_timeout,
                 max_task_duration=max_task_duration,
-                monitor_log_path=monitor_log_path
+                monitor_log_path=monitor_log_path,
+                enable_task_requeue=enable_task_requeue,
+                max_pages_per_pdf=max_pages_per_pdf
             )
             self.gpu_pools[gpu_id] = pool
     
@@ -772,7 +818,7 @@ class MultiGPUProcessManager:
         
         return results
 
-def gpu_specific_worker(worker_id: int, gpu_id: int, task_queue: mp.Queue, result_queue: mp.Queue, monitor_log_path: Optional[str] = None):
+def gpu_specific_worker(worker_id: int, gpu_id: int, task_queue: mp.Queue, result_queue: mp.Queue, monitor_log_path: Optional[str] = None, max_pages_per_pdf: Optional[int] = None):
     """GPU特定的工作进程函数"""
     # 设置特定的GPU设备
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -823,7 +869,7 @@ def gpu_specific_worker(worker_id: int, gpu_id: int, task_queue: mp.Queue, resul
                     print(f"Warning: Could not get page count for {file_path}: {e}")
                     pages_processed = 1  # 默认至少有1页
 
-                output_file = process_one_pdf_file(file_path, save_dir)
+                output_file = process_one_pdf_file(file_path, save_dir, max_pages_per_pdf=max_pages_per_pdf)
                 et = time.time()
 
                 # 发送统计信息
@@ -937,7 +983,9 @@ def run_with_multi_gpu_pools():
         processes_per_gpu=args.num_processes,
         task_timeout=args.task_timeout,
         max_task_duration=args.max_task_duration,
-        monitor_log_path=args.monitor_log_path
+        monitor_log_path=args.monitor_log_path,
+        enable_task_requeue=args.enable_task_requeue,
+        max_pages_per_pdf=args.max_pages_per_pdf
     )
     
     try:
