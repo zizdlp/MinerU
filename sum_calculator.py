@@ -13,19 +13,33 @@ def calculate_sum_with_timestamp(data_filename, logfile="logs/sum_history.log"):
     # 确保日志目录存在
     os.makedirs(os.path.dirname(logfile) if os.path.dirname(logfile) else '.', exist_ok=True)
     
-    # 读取数字文件并计算总和（支持两列格式：文件名\t页数）
+    # 读取数字文件并计算总和（支持三列格式：文件名\t页数\t状态）
     try:
         with open(data_filename, 'r', encoding='utf-8') as f:
             numbers = []
+            skipped_count = 0
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
 
-                # 检查是否是两列格式（文件名\t页数）
+                # 检查是否是三列格式（文件名\t页数\t状态）
                 if '\t' in line:
                     parts = line.split('\t')
-                    if len(parts) >= 2:
+                    if len(parts) >= 3:
+                        # 三列格式：只统计状态为done的数据
+                        status = parts[2].lower()
+                        if status == 'done':
+                            try:
+                                page_count = int(parts[1])
+                                numbers.append(page_count)
+                            except ValueError:
+                                print(f"警告: 无法解析页数 '{parts[1]}' 在行: {line}")
+                                continue
+                        else:
+                            skipped_count += 1
+                    elif len(parts) >= 2:
+                        # 兼容两列格式（文件名\t页数）
                         try:
                             page_count = int(parts[1])
                             numbers.append(page_count)
@@ -43,6 +57,7 @@ def calculate_sum_with_timestamp(data_filename, logfile="logs/sum_history.log"):
 
         current_sum = sum(numbers)
         file_count = len(numbers)
+        processed_count = file_count  # done状态的文件数
     except FileNotFoundError:
         print(f"错误: 数据文件 {data_filename} 不存在")
         return
@@ -78,15 +93,17 @@ def calculate_sum_with_timestamp(data_filename, logfile="logs/sum_history.log"):
         increment_per_second = sum_increment / time_diff if time_diff > 0 else 0
         
         print(f"时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"处理文件数: {file_count}")
-        print(f"当前总页数: {current_sum}")
+        print(f"已完成文件数: {processed_count}")
+        print(f"跳过文件数(未完成): {skipped_count}")
+        print(f"已完成总页数: {current_sum}")
         print(f"距离上次计算时间差: {time_diff:.2f}秒")
         print(f"页数增量: {sum_increment}")
         print(f"平均增速: {increment_per_second:.2f}页/秒")
     else:
         print(f"时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"处理文件数: {file_count}")
-        print(f"当前总页数: {current_sum}")
+        print(f"已完成文件数: {processed_count}")
+        print(f"跳过文件数(未完成): {skipped_count}")
+        print(f"已完成总页数: {current_sum}")
         print("首次记录")
     
     # 记录本次结果到新的日志文件

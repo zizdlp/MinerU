@@ -101,11 +101,11 @@ def process_one_pdf_file(pdf_path, save_dir, lang="en"):
         if not os.path.exists(logs_dir):
             os.makedirs(logs_dir, exist_ok=True)
 
-        # Write PDF name and page count to count_page.txt (two columns)
+        # Write PDF name and page count to count_page.txt (three columns: filename, page_count, status)
         count_file = os.path.join(logs_dir, "count_page.txt")
         pdf_filename = os.path.basename(pdf_path)
         with open(count_file, "a", encoding="utf-8") as f:
-            f.write(f"{pdf_filename}\t{page_count}\n")
+            f.write(f"{pdf_filename}\t{page_count}\tprocessing\n")
 
         logger.info(f"PDF {pdf_path} has {page_count} pages, written to {count_file}")
     except Exception as e:
@@ -120,6 +120,36 @@ def process_one_pdf_file(pdf_path, save_dir, lang="en"):
         zf.writestr(f"{pdf_file_name}.json", res_json_bytes)
 
     post_size = os.path.getsize(target_file)
+
+    # Update status to done in count_page.txt
+    try:
+        logs_dir = "logs"
+        count_file = os.path.join(logs_dir, "count_page.txt")
+        pdf_filename = os.path.basename(pdf_path)
+
+        # Read all lines
+        if os.path.exists(count_file):
+            with open(count_file, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+
+            # Update the status for this file
+            updated_lines = []
+            for line in lines:
+                parts = line.strip().split('\t')
+                if len(parts) >= 2 and parts[0] == pdf_filename:
+                    # Update status to done, preserve page count
+                    page_count = parts[1] if len(parts) > 1 else "unknown"
+                    updated_lines.append(f"{pdf_filename}\t{page_count}\tdone\n")
+                else:
+                    updated_lines.append(line)
+
+            # Write back the updated content
+            with open(count_file, "w", encoding="utf-8") as f:
+                f.writelines(updated_lines)
+
+        logger.info(f"Updated {pdf_filename} status to done in {count_file}")
+    except Exception as e:
+        logger.error(f"Failed to update status for {pdf_path}: {e}")
 
     logger.info(f"Finished processing PDF file: {pdf_path}, and saved to {target_file}")
     return target_file
@@ -143,6 +173,7 @@ class GPUProcessPool:
         self.worker_stats: Dict[int, Dict] = {}  # 记录每个worker的统计信息
         self.worker_pids: Dict[int, int] = {}  # 记录worker的真实进程PID
         self.worker_current_tasks: Dict[int, str] = {}  # 记录每个worker当前处理的任务文件
+        self.worker_current_task_data: Dict[int, Any] = {}  # 记录每个worker当前处理的完整任务数据
         self.lock = threading.Lock()
         self.is_running = False
         self.monitor_thread = None
@@ -407,8 +438,41 @@ class GPUProcessPool:
                             del self.worker_status[worker_id]
                         if worker_id in self.worker_last_heartbeat:
                             del self.worker_last_heartbeat[worker_id]
+                        # 如果worker正在处理任务，将任务重新入队
+                        if (worker_id in self.worker_current_task_data and
+                            self.worker_status.get(worker_id) == 'busy'):
+                            task_data = self.worker_current_task_data[worker_id]
+                            task_file = self.worker_current_tasks.get(worker_id, 'unknown')
+                            self.task_queue.put(task_data)
+                            print(f"GPU {self.gpu_id} requeued task {task_file} due to worker {worker_id} {reason}")
+
+                            # 记录任务重新入队事件
+                            logs_dir = "logs"
+                            if not os.path.exists(logs_dir):
+                                os.makedirs(logs_dir, exist_ok=True)
+
+                            requeue_log_file = os.path.join(logs_dir, "task_requeue.txt")
+                            current_time = time.time()
+                            timestamp = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time))
+
+                            requeue_info = {
+                                'timestamp': timestamp,
+                                'unix_timestamp': current_time,
+                                'event_type': 'task_requeue',
+                                'gpu_id': self.gpu_id,
+                                'worker_id': worker_id,
+                                'task_file': task_file,
+                                'reason': reason,
+                                'action': 'requeued_for_retry'
+                            }
+
+                            with open(requeue_log_file, "a", encoding="utf-8") as f:
+                                f.write(json.dumps(requeue_info, ensure_ascii=False) + '\n')
+
                         if worker_id in self.worker_current_tasks:
                             del self.worker_current_tasks[worker_id]
+                        if worker_id in self.worker_current_task_data:
+                            del self.worker_current_task_data[worker_id]
                         if worker_id in self.worker_stats:
                             del self.worker_stats[worker_id]
                         if worker_id in self.worker_pids:
@@ -446,13 +510,15 @@ class GPUProcessPool:
         with self.lock:
             self.worker_last_heartbeat[worker_id] = time.time()
 
-    def update_task_start(self, worker_id: int, start_time: float, task_file: str = None):
+    def update_task_start(self, worker_id: int, start_time: float, task_file: str = None, task_data: Any = None):
         """更新任务开始时间"""
         with self.lock:
             self.worker_task_start_times[worker_id] = start_time
             self.worker_status[worker_id] = 'busy'
             if task_file:
                 self.worker_current_tasks[worker_id] = task_file
+            if task_data:
+                self.worker_current_task_data[worker_id] = task_data
             print(f"GPU {self.gpu_id} worker {worker_id} started task at {start_time}, file: {task_file or 'unknown'}")
 
     def update_task_end(self, worker_id: int):
@@ -462,6 +528,8 @@ class GPUProcessPool:
             self.worker_status[worker_id] = 'idle'
             if worker_id in self.worker_current_tasks:
                 del self.worker_current_tasks[worker_id]
+            if worker_id in self.worker_current_task_data:
+                del self.worker_current_task_data[worker_id]
             print(f"GPU {self.gpu_id} worker {worker_id} finished task")
 
     def update_worker_stats(self, worker_id: int, pages_processed: int):
@@ -679,7 +747,8 @@ class MultiGPUProcessManager:
                         pool.update_heartbeat(result_data['worker_id'])
                     elif result_data['type'] == 'task_start':
                         # 更新任务开始时间和当前任务文件
-                        pool.update_task_start(result_data['worker_id'], result_data['start_time'], result_data.get('task_file'))
+                        pool.update_task_start(result_data['worker_id'], result_data['start_time'],
+                                             result_data.get('task_file'), result_data.get('task_data'))
                     elif result_data['type'] == 'task_stats':
                         # 更新任务统计信息
                         pool.update_worker_stats(result_data['worker_id'], result_data['pages_processed'])
@@ -738,7 +807,8 @@ def gpu_specific_worker(worker_id: int, gpu_id: int, task_queue: mp.Queue, resul
                 'gpu_id': gpu_id,
                 'start_time': bt,
                 'timestamp': bt,
-                'task_file': file_path
+                'task_file': file_path,
+                'task_data': task_data
             })
 
             try:
