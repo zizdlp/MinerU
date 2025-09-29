@@ -14,6 +14,7 @@
 ### 📊 智能监控系统
 - **实时进程监控**：监控每个工作进程的状态和心跳
 - **任务超时管理**：自动检测并重启超时的工作进程
+- **CPU利用率监控**：检测低效或卡死的进程并自动重启
 - **性能统计**：记录处理页数、耗时等统计信息
 - **详细日志**：可选的进程监控日志记录
 
@@ -24,6 +25,7 @@
 - **输出格式**：结果以压缩JSON格式保存
 - **任务重新入队**：失败任务自动重新处理
 - **页数限制**：跳过超大PDF文件避免资源浪费
+- **CPU监控**：自动检测低效进程并重启
 
 ## 核心组件
 
@@ -78,6 +80,9 @@ python ocr_pdf_with_mineru.py \
 | `--monitor-log-path` | str | None | 进程监控日志路径 |
 | `--enable-task-requeue` | flag | False | 启用任务重新入队功能 |
 | `--max-pages-per-pdf` | int | None | PDF文件最大页数限制，超过则跳过 |
+| `--enable-cpu-monitor` | flag | False | 启用CPU利用率监控 |
+| `--cpu-idle-threshold` | float | 5.0 | CPU空闲阈值（百分比） |
+| `--cpu-idle-duration` | int | 300 | CPU空闲持续时间阈值（秒） |
 
 ### 使用示例
 
@@ -112,6 +117,18 @@ python ocr_pdf_with_mineru.py \
   --max-pages-per-pdf 1000
 ```
 
+#### 启用CPU监控功能
+```bash
+python ocr_pdf_with_mineru.py \
+  --input-dir ./pdfs \
+  --output-dir ./results \
+  --cuda-devices "0,1,2,3" \
+  --num-processes 2 \
+  --enable-cpu-monitor \
+  --cpu-idle-threshold 5.0 \
+  --cpu-idle-duration 300
+```
+
 #### 完整配置示例
 ```bash
 python ocr_pdf_with_mineru.py \
@@ -121,9 +138,12 @@ python ocr_pdf_with_mineru.py \
   --num-processes 3 \
   --vram-size-gb 8 \
   --task-timeout 1800 \
-  --max-task-duration 6000 \
+  --max-task-duration 3600 \
   --enable-task-requeue \
   --max-pages-per-pdf 1000 \
+  --enable-cpu-monitor \
+  --cpu-idle-threshold 5.0 \
+  --cpu-idle-duration 300 \
   --monitor-log-path ./logs/process \
   --log-dir ./logs
 ```
@@ -315,6 +335,52 @@ python ocr_pdf_with_mineru.py \
 **状态标记：**
 - 超过页数限制的文件状态标记为 `skipped_too_many_pages`
 - 可通过 `make cal` 命令查看跳过的文件统计
+
+### CPU利用率监控 (CPU Monitoring)
+
+**功能描述：**
+实时监控worker进程的CPU利用率，自动检测和处理低效或卡死的进程，确保系统资源的高效利用。
+
+**使用方法：**
+```bash
+python ocr_pdf_with_mineru.py \
+  --input-dir ./pdfs \
+  --output-dir ./results \
+  --enable-cpu-monitor \
+  --cpu-idle-threshold 5.0 \
+  --cpu-idle-duration 300
+```
+
+**监控机制：**
+- **实时监控**：每3秒检查一次worker进程的CPU使用率
+- **历史记录**：保留最近100次CPU使用率采样
+- **智能检测**：只监控正在处理任务（busy状态）的worker
+- **自动处理**：CPU使用率持续低于阈值超过指定时间时自动重启进程
+
+**触发条件：**
+```
+CPU使用率 < 5% 且持续 > 5分钟 → 杀死进程并重启
+```
+
+**适用场景：**
+- 检测卡死的worker进程（进程存在但不执行计算）
+- 发现代码陷入低效循环或I/O阻塞
+- 处理内存泄漏后的降级运行状态
+- 自动恢复无响应但仍在运行的异常进程
+
+**日志记录：**
+CPU空闲超时事件记录在 `logs/anomaly_events.txt`：
+```json
+{
+  "event_type": "cpu_idle_timeout",
+  "gpu_id": 0,
+  "worker_id": 2,
+  "cpu_usage_percent": 2.5,
+  "idle_duration_seconds": 305.2,
+  "cpu_threshold": 5.0,
+  "action": "kill_and_restart"
+}
+```
 
 ### 统计命令增强
 

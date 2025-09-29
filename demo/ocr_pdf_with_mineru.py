@@ -1,5 +1,3 @@
-from loguru import logger
-
 import copy
 import glob
 import os
@@ -18,6 +16,23 @@ from typing import Callable, Any, List, Dict, Optional, Tuple
 import signal
 import psutil
 import fitz  # PyMuPDF
+from collections import defaultdict, deque
+
+# 在这里设置一个简单的logger，避免导入loguru
+class SimpleLogger:
+    @staticmethod
+    def info(msg):
+        print(f"[INFO] {msg}")
+
+    @staticmethod
+    def warning(msg):
+        print(f"[WARNING] {msg}")
+
+    @staticmethod
+    def error(msg):
+        print(f"[ERROR] {msg}")
+
+logger = SimpleLogger()
 
 parser = argparse.ArgumentParser(description="MB PDF OCR")
 parser.add_argument('--input-dir', type=str, required=True, help='输入数据集的目录')
@@ -31,6 +46,9 @@ parser.add_argument('--max-task-duration', type=int, default=1800, help='每个�
 parser.add_argument('--monitor-log-path', type=str, default=None, help='进程监控日志路径，用于记录每个进程的处理统计')
 parser.add_argument('--enable-task-requeue', action='store_true', default=False, help='是否启用任务重新入队功能，当worker超时或崩溃时重新处理任务')
 parser.add_argument('--max-pages-per-pdf', type=int, default=None, help='PDF文件最大页数限制，超过此页数的PDF将被跳过处理')
+parser.add_argument('--enable-cpu-monitor', action='store_true', default=False, help='启用CPU利用率监控，低利用率进程将被终止')
+parser.add_argument('--cpu-idle-threshold', type=float, default=5.0, help='CPU利用率阈值，低于此值视为空闲（默认5%）')
+parser.add_argument('--cpu-idle-duration', type=int, default=300, help='CPU空闲持续时间阈值（秒），默认300秒即5分钟')
 args = parser.parse_args()
 
 def infer_one_pdf(pdf_file_path, lang="en"):
@@ -177,6 +195,9 @@ class GPUProcessPool:
     monitor_log_path: Optional[str] = None  # 监控日志路径
     enable_task_requeue: bool = False  # 是否启用任务重新入队
     max_pages_per_pdf: Optional[int] = None  # PDF最大页数限制
+    enable_cpu_monitor: bool = False  # 是否启用CPU监控
+    cpu_idle_threshold: float = 5.0  # CPU空闲阈值（百分比）
+    cpu_idle_duration: int = 300  # CPU空闲持续时间阈值（秒）
 
     def __post_init__(self):
         self.task_queue = mp.Queue()
@@ -189,11 +210,14 @@ class GPUProcessPool:
         self.worker_pids: Dict[int, int] = {}  # 记录worker的真实进程PID
         self.worker_current_tasks: Dict[int, str] = {}  # 记录每个worker当前处理的任务文件
         self.worker_current_task_data: Dict[int, Any] = {}  # 记录每个worker当前处理的完整任务数据
+        self.worker_cpu_history: Dict[int, deque] = {}  # 记录每个worker的CPU利用率历史
+        self.worker_cpu_low_start: Dict[int, Optional[float]] = {}  # 记录每个worker开始低CPU利用率的时间
         self.lock = threading.Lock()
         self.is_running = False
         self.monitor_thread = None
         self.stats_thread = None  # 统计输出线程
         self.process_count_thread = None  # 进程数统计线程
+        self.cpu_monitor_thread = None  # CPU监控线程
         self.worker_counter = 0
         self.restart_count = 0  # 重启计数器
         
@@ -222,6 +246,8 @@ class GPUProcessPool:
                 'last_10min_pages': 0,
                 'last_10min_time': time.time()
             }
+            self.worker_cpu_history[worker_id] = deque(maxlen=100)  # 保留最近100次采样
+            self.worker_cpu_low_start[worker_id] = None
 
         print(f"Created worker {worker_id} (PID: {process.pid}) on GPU {self.gpu_id}")
         return worker_id
@@ -286,6 +312,112 @@ class GPUProcessPool:
             f.write(json.dumps(restart_info, ensure_ascii=False) + '\n')
 
         logger.info(f"GPU {self.gpu_id} Worker {worker_id} (PID {old_pid}) restarted as Worker {new_worker_id} (PID {new_pid}), reason: {reason}")
+
+    def _log_cpu_idle_event(self, worker_id: int, cpu_usage: float, idle_duration: float, task_file: str = None):
+        """记录CPU空闲超时事件到异常日志文件"""
+        logs_dir = "logs"
+        if not os.path.exists(logs_dir):
+            os.makedirs(logs_dir, exist_ok=True)
+
+        anomaly_log_file = os.path.join(logs_dir, "anomaly_events.txt")
+        current_time = time.time()
+        timestamp = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time))
+
+        pid = self.worker_pids.get(worker_id, 'unknown')
+
+        idle_info = {
+            'timestamp': timestamp,
+            'unix_timestamp': current_time,
+            'event_type': 'cpu_idle_timeout',
+            'gpu_id': self.gpu_id,
+            'worker_id': worker_id,
+            'pid': pid,
+            'cpu_usage_percent': cpu_usage,
+            'idle_duration_seconds': idle_duration,
+            'cpu_threshold': self.cpu_idle_threshold,
+            'task_file': task_file or self.worker_current_tasks.get(worker_id, 'unknown'),
+            'action': 'kill_and_restart'
+        }
+
+        with open(anomaly_log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(idle_info, ensure_ascii=False) + '\n')
+
+        logger.warning(f"GPU {self.gpu_id} Worker {worker_id} (PID {pid}) CPU idle timeout: "
+                      f"usage={cpu_usage:.1f}%, duration={idle_duration:.1f}s, task={task_file or 'unknown'}, killed and restarted")
+
+    def _monitor_cpu(self):
+        """专门的CPU监控线程"""
+        if not self.enable_cpu_monitor:
+            return
+
+        while self.is_running:
+            time.sleep(3)  # 每3秒检查一次CPU使用率
+
+            current_time = time.time()
+            workers_to_kill = []
+
+            with self.lock:
+                # 检查所有正在处理任务的worker的CPU使用率
+                for worker_id, process in list(self.workers.items()):
+                    if (not process.is_alive() or
+                        self.worker_status.get(worker_id) != 'busy' or
+                        worker_id not in self.worker_pids):
+                        continue
+
+                    try:
+                        pid = self.worker_pids[worker_id]
+                        proc = psutil.Process(pid)
+                        cpu_percent = proc.cpu_percent()
+
+                        # 记录CPU使用率历史
+                        self.worker_cpu_history[worker_id].append((current_time, cpu_percent))
+
+                        # 检查是否低于阈值
+                        if cpu_percent < self.cpu_idle_threshold:
+                            # 如果这是第一次检测到低CPU使用率
+                            if self.worker_cpu_low_start[worker_id] is None:
+                                self.worker_cpu_low_start[worker_id] = current_time
+                                print(f"GPU {self.gpu_id} worker {worker_id} CPU usage low: {cpu_percent:.1f}% (threshold: {self.cpu_idle_threshold}%)")
+                            # 检查是否持续时间超过阈值
+                            elif current_time - self.worker_cpu_low_start[worker_id] > self.cpu_idle_duration:
+                                idle_duration = current_time - self.worker_cpu_low_start[worker_id]
+                                task_file = self.worker_current_tasks.get(worker_id, 'unknown')
+                                print(f"GPU {self.gpu_id} worker {worker_id} CPU idle timeout ({cpu_percent:.1f}% < {self.cpu_idle_threshold}% for {idle_duration:.1f}s)")
+
+                                # 记录CPU空闲超时事件
+                                self._log_cpu_idle_event(worker_id, cpu_percent, idle_duration, task_file)
+
+                                # 标记为需要杀死的worker
+                                workers_to_kill.append((worker_id, "cpu_idle_timeout"))
+                        else:
+                            # CPU使用率正常，重置低使用率开始时间
+                            if self.worker_cpu_low_start[worker_id] is not None:
+                                print(f"GPU {self.gpu_id} worker {worker_id} CPU usage recovered: {cpu_percent:.1f}%")
+                            self.worker_cpu_low_start[worker_id] = None
+
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        # 进程不存在或无法访问，跳过
+                        continue
+                    except Exception as e:
+                        # 其他异常，记录但不终止进程
+                        print(f"GPU {self.gpu_id} worker {worker_id} CPU monitoring error: {e}")
+                        continue
+
+            # 杀死CPU空闲超时的worker
+            for worker_id, reason in workers_to_kill:
+                with self.lock:
+                    if worker_id in self.workers:
+                        process = self.workers[worker_id]
+                        try:
+                            print(f"GPU {self.gpu_id} terminating worker {worker_id} due to {reason}")
+                            process.terminate()
+                            process.join(timeout=3)
+                            if process.is_alive():
+                                process.kill()
+                        except Exception as e:
+                            print(f"GPU {self.gpu_id} error terminating worker {worker_id}: {e}")
+
+        print(f"GPU {self.gpu_id} CPU monitoring thread exiting")
 
     def _monitor_process_count(self):
         """每分钟记录活跃进程数和检测异常情况，分别写入不同日志文件"""
@@ -414,6 +546,7 @@ class GPUProcessPool:
                         workers_to_remove.append((worker_id, "heartbeat_timeout"))
                         continue
 
+
                     # 检查任务执行时间限制（只有在忙碌状态时才检查）
                     if (self.worker_status.get(worker_id) == 'busy' and
                         self.worker_task_start_times.get(worker_id, 0) > 0):
@@ -521,6 +654,10 @@ class GPUProcessPool:
                             del self.worker_stats[worker_id]
                         if worker_id in self.worker_pids:
                             del self.worker_pids[worker_id]
+                        if worker_id in self.worker_cpu_history:
+                            del self.worker_cpu_history[worker_id]
+                        if worker_id in self.worker_cpu_low_start:
+                            del self.worker_cpu_low_start[worker_id]
 
                         # 创建新进程
                         new_worker_id = self._create_worker()
@@ -657,6 +794,12 @@ class GPUProcessPool:
         self.process_count_thread.start()
         print(f"GPU {self.gpu_id} process count monitoring started")
 
+        # 启动CPU监控线程
+        if self.enable_cpu_monitor:
+            self.cpu_monitor_thread = threading.Thread(target=self._monitor_cpu, daemon=True)
+            self.cpu_monitor_thread.start()
+            print(f"GPU {self.gpu_id} CPU monitoring started (threshold: {self.cpu_idle_threshold}%, duration: {self.cpu_idle_duration}s)")
+
         print(f"GPU {self.gpu_id} process pool started with {self.num_processes} workers")
     
     def stop(self):
@@ -699,6 +842,8 @@ class GPUProcessPool:
             self.worker_current_tasks.clear()
             self.worker_stats.clear()
             self.worker_pids.clear()
+            self.worker_cpu_history.clear()
+            self.worker_cpu_low_start.clear()
 
         # 停止监控线程
         if self.monitor_thread and self.monitor_thread.is_alive():
@@ -709,6 +854,9 @@ class GPUProcessPool:
 
         if self.process_count_thread and self.process_count_thread.is_alive():
             self.process_count_thread.join(timeout=3)
+
+        if self.cpu_monitor_thread and self.cpu_monitor_thread.is_alive():
+            self.cpu_monitor_thread.join(timeout=3)
 
         # 记录最终停止状态
         logs_dir = "logs"
@@ -735,7 +883,7 @@ class MultiGPUProcessManager:
     """多GPU进程管理器"""
 
     def __init__(self, gpu_devices: List[int], processes_per_gpu: int,
-                 task_timeout: int = 1800, max_task_duration: int = 1800, monitor_log_path: Optional[str] = None, enable_task_requeue: bool = False, max_pages_per_pdf: Optional[int] = None):
+                 task_timeout: int = 1800, max_task_duration: int = 1800, monitor_log_path: Optional[str] = None, enable_task_requeue: bool = False, max_pages_per_pdf: Optional[int] = None, enable_cpu_monitor: bool = False, cpu_idle_threshold: float = 5.0, cpu_idle_duration: int = 300):
         self.gpu_pools: Dict[int, GPUProcessPool] = {}
         self.lock = threading.Lock()
 
@@ -748,7 +896,10 @@ class MultiGPUProcessManager:
                 max_task_duration=max_task_duration,
                 monitor_log_path=monitor_log_path,
                 enable_task_requeue=enable_task_requeue,
-                max_pages_per_pdf=max_pages_per_pdf
+                max_pages_per_pdf=max_pages_per_pdf,
+                enable_cpu_monitor=enable_cpu_monitor,
+                cpu_idle_threshold=cpu_idle_threshold,
+                cpu_idle_duration=cpu_idle_duration
             )
             self.gpu_pools[gpu_id] = pool
     
@@ -985,7 +1136,10 @@ def run_with_multi_gpu_pools():
         max_task_duration=args.max_task_duration,
         monitor_log_path=args.monitor_log_path,
         enable_task_requeue=args.enable_task_requeue,
-        max_pages_per_pdf=args.max_pages_per_pdf
+        max_pages_per_pdf=args.max_pages_per_pdf,
+        enable_cpu_monitor=args.enable_cpu_monitor,
+        cpu_idle_threshold=args.cpu_idle_threshold,
+        cpu_idle_duration=args.cpu_idle_duration
     )
     
     try:
